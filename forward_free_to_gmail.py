@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Forward emails from Free.fr to Gmail via IMAP IDLE (push).
+Forward emails from Free.fr to Gmail via IMAP IDLE (push) — compatible Windows.
 
 1. Lance setup_credentials.py une première fois pour chiffrer tes mots de passe.
-2. Lance ce script en continu :
-       python3 forward_free_to_gmail.py
+2. Lance ce script :
+       python forward_free_to_gmail.py
+   Ou double-clique sur start.bat
 
 Le script maintient une connexion IMAP persistante et utilise IDLE pour être
 notifié instantanément à chaque nouvel email — zéro polling, zéro délai.
@@ -16,11 +17,12 @@ import imaplib
 import smtplib
 import email
 import logging
-import select
+import socket
 import signal
 import sys
 import json
 import time
+import threading
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -30,7 +32,7 @@ from email import encoders
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:
-    print("❌ Module manquant : pip install cryptography")
+    print("Module manquant : pip install cryptography")
     sys.exit(1)
 
 # ─────────────────────────────────────────────
@@ -43,19 +45,19 @@ CREDS_FILE = BASE_DIR / "credentials.enc"
 
 def load_credentials() -> dict:
     if not KEY_FILE.exists():
-        print(f"❌ Clé introuvable : {KEY_FILE}")
-        print("   Lancez d'abord : python3 setup_credentials.py")
+        print(f"Cle introuvable : {KEY_FILE}")
+        print("   Lancez d'abord : python setup_credentials.py")
         sys.exit(1)
     if not CREDS_FILE.exists():
-        print(f"❌ Credentials introuvables : {CREDS_FILE}")
-        print("   Lancez d'abord : python3 setup_credentials.py")
+        print(f"Credentials introuvables : {CREDS_FILE}")
+        print("   Lancez d'abord : python setup_credentials.py")
         sys.exit(1)
     try:
         fernet    = Fernet(KEY_FILE.read_bytes())
         decrypted = fernet.decrypt(CREDS_FILE.read_bytes())
         return json.loads(decrypted)
     except InvalidToken:
-        print("❌ Déchiffrement impossible : clé incorrecte ou fichier corrompu.")
+        print("Dechiffrement impossible : cle incorrecte ou fichier corrompu.")
         sys.exit(1)
 
 
@@ -68,11 +70,21 @@ GMAIL_PASSWORD = _creds["GMAIL_PASSWORD"]
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-FREE_INBOX   = "INBOX"
+# Dossiers IMAP a surveiller. Ajoute ou retire des entrees selon tes besoins.
+# Le nom exact doit correspondre au nom du dossier sur le serveur Free.fr.
+IMAP_FOLDERS = [
+    "INBOX",
+    "Flux d'activite",   # verifier le nom exact via un client mail
+]
 
-# IMAP IDLE expire après 30 min côté serveur (RFC 2177 recommande 29 min max).
+
+# IMAP IDLE expire après 30 min côté serveur (RFC 2177).
 # On renouvelle la connexion toutes les 28 minutes par sécurité.
 IDLE_TIMEOUT = 28 * 60
+
+# Timeout de lecture bloquante sur le socket (en secondes).
+# Le thread IDLE se réveille toutes les 60 s pour vérifier l'arrêt demandé.
+SOCKET_READ_TIMEOUT = 60
 
 # Backoff exponentiel en cas d'erreur réseau : 5s, 10s, 20s … jusqu'à 5 min max.
 RECONNECT_DELAY_INIT = 5
@@ -94,23 +106,29 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(BASE_DIR / "forward.log"),
+        logging.FileHandler(BASE_DIR / "forward.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# ARRÊT PROPRE (Ctrl+C / SIGTERM)
+# ARRET PROPRE  (Ctrl+C sur Windows et Linux)
+# SIGTERM n'existe pas sur Windows — on gère uniquement SIGINT (Ctrl+C)
 # ─────────────────────────────────────────────
 _running = True
+_stop_event = threading.Event()
+
 
 def _handle_signal(sig, frame):
     global _running
-    log.info("Signal %s reçu — arrêt en cours…", sig)
+    log.info("Arret demande (signal %s)...", sig)
     _running = False
+    _stop_event.set()
 
-signal.signal(signal.SIGINT,  _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+
+signal.signal(signal.SIGINT, _handle_signal)
+if hasattr(signal, "SIGTERM"):          # absent sur Windows
+    signal.signal(signal.SIGTERM, _handle_signal)
 
 
 # ─────────────────────────────────────────────
@@ -123,9 +141,9 @@ def build_forward_message(original: email.message.Message) -> MIMEMultipart:
     fwd["Subject"] = "Fwd: " + original.get("Subject", "(sans objet)")
 
     header_text = (
-        f"\n---------- Message transféré ----------\n"
+        f"\n---------- Message transfere ----------\n"
         f"De      : {original.get('From', '')}\n"
-        f"À       : {original.get('To', '')}\n"
+        f"A       : {original.get('To', '')}\n"
         f"Date    : {original.get('Date', '')}\n"
         f"Objet   : {original.get('Subject', '')}\n"
         f"---------------------------------------\n\n"
@@ -175,110 +193,117 @@ def send_via_gmail(original: email.message.Message):
 
 
 # ─────────────────────────────────────────────
-# FETCH & FORWARD DES MESSAGES NON LUS
+# FETCH & FORWARD
 # ─────────────────────────────────────────────
 def fetch_and_forward(imap: imaplib.IMAP4_SSL) -> int:
-    """Récupère tous les UNSEEN, les forward et les marque comme lus. Retourne le nombre traités."""
     _, uids_raw = imap.uid("search", None, "UNSEEN")
     uids = uids_raw[0].split()
     if not uids:
         return 0
 
-    log.info("%d nouveau(x) message(s) à transférer.", len(uids))
+    log.info("%d nouveau(x) message(s) a transferer.", len(uids))
     count = 0
     for uid in uids:
         _, msg_data = imap.uid("fetch", uid, "(RFC822)")
         original = email.message_from_bytes(msg_data[0][1])
-        subject  = original.get("Subject", "(sans objet)")
-        log.info("  → %s", subject)
+        log.info("  -> %s", original.get("Subject", "(sans objet)"))
         try:
             send_via_gmail(original)
             imap.uid("store", uid, "+FLAGS", "\\Seen")
             count += 1
-            log.info("    ✓ Transféré et marqué comme lu.")
+            log.info("     Transfere et marque comme lu.")
         except Exception as e:
-            log.error("    ✗ Erreur : %s", e)
+            log.error("     Erreur : %s", e)
 
     return count
 
 
 # ─────────────────────────────────────────────
-# CONNEXION IMAP
+# CONNEXION IMAP (une connexion par dossier)
 # ─────────────────────────────────────────────
-def connect_imap() -> imaplib.IMAP4_SSL:
+def connect_imap(folder: str) -> imaplib.IMAP4_SSL:
     imap = imaplib.IMAP4_SSL(FREE_IMAP_HOST, FREE_IMAP_PORT)
     imap.login(FREE_EMAIL, FREE_PASSWORD)
-    imap.select(FREE_INBOX)
-    log.info("Connecté à %s (%s)", FREE_IMAP_HOST, FREE_INBOX)
+    status, detail = imap.select(folder)
+    if status != "OK":
+        raise RuntimeError(f"Dossier introuvable : {folder!r} ({detail})")
+    log.info("[%s] Connecte.", folder)
     return imap
 
 
 # ─────────────────────────────────────────────
-# BOUCLE IMAP IDLE
+# BOUCLE IMAP IDLE pour un dossier  — compatible Windows
+#
+# Sur Windows, select.select() ne fonctionne pas sur les sockets SSL.
+# On utilise socket.settimeout() sur le socket sous-jacent :
+# readline() bloque jusqu'a reception de donnees ou jusqu'au timeout.
 # ─────────────────────────────────────────────
-def idle_loop(imap: imaplib.IMAP4_SSL):
-    """
-    Entre en mode IDLE et attend une notification serveur.
-    Traite les nouveaux messages dès leur arrivée.
-    Renouvelle la session après IDLE_TIMEOUT secondes.
-    Retourne quand _running devient False ou quand une reconnexion est nécessaire.
-    """
-    # Traiter d'abord les éventuels messages déjà non lus à la connexion
+def idle_loop(imap: imaplib.IMAP4_SSL, folder: str):
+    # Traiter les eventuels messages deja non lus a la connexion
     fetch_and_forward(imap)
+
+    raw_sock = imap.socket()
+    raw_sock.settimeout(SOCKET_READ_TIMEOUT)
 
     deadline = time.monotonic() + IDLE_TIMEOUT
 
     while _running:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            log.info("Renouvellement IDLE (timeout %d min).", IDLE_TIMEOUT // 60)
-            return  # le caller reconnecte
+            log.info("[%s] Renouvellement IDLE (timeout %d min).", folder, IDLE_TIMEOUT // 60)
+            return  # le caller se reconnecte
 
-        # Envoyer la commande IDLE
         tag = imap._new_tag().decode()
         imap.send(f"{tag} IDLE\r\n".encode())
         imap.readline()  # "+ idling"
 
-        # Attendre une réponse serveur ou le timeout
-        sock = imap.socket()
-        timeout = min(remaining, 60)  # vérifie _running toutes les 60 s max
-        ready, _, _ = select.select([sock], [], [], timeout)
+        notified = False
+        idle_start = time.monotonic()
 
-        # Sortir d'IDLE proprement
-        imap.send(b"DONE\r\n")
-
-        if ready:
-            # Lire la réponse IDLE (peut contenir "EXISTS", "RECENT", etc.)
-            response = b""
-            while True:
-                chunk = imap.readline()
-                response += chunk
-                # La réponse se termine par la ligne "tag OK IDLE terminated"
-                if tag.encode() in chunk:
+        while _running and (time.monotonic() - idle_start) < min(remaining, IDLE_TIMEOUT):
+            try:
+                line = imap.readline()
+                if b"EXISTS" in line or b"RECENT" in line:
+                    notified = True
                     break
+                if tag.encode() in line:
+                    break
+            except (socket.timeout, TimeoutError):
+                break
 
-            if b"EXISTS" in response or b"RECENT" in response:
-                log.info("📬 Notification serveur — vérification des nouveaux messages…")
-                fetch_and_forward(imap)
+        try:
+            imap.send(b"DONE\r\n")
+            while True:
+                line = imap.readline()
+                if tag.encode() in line:
+                    break
+        except Exception:
+            pass
+
+        if notified:
+            log.info("[%s] Notification -- verification des nouveaux messages...", folder)
+            fetch_and_forward(imap)
+        elif not _running:
+            break
         else:
-            # Timeout : juste un NOOP pour maintenir la connexion vivante
-            imap.noop()
+            try:
+                imap.noop()
+            except Exception:
+                raise  # connexion perdue, le caller reconnecte
 
-    log.info("Boucle IDLE terminée.")
+    log.info("[%s] Boucle IDLE terminee.", folder)
 
 
 # ─────────────────────────────────────────────
-# POINT D'ENTRÉE
+# WORKER PAR DOSSIER  (tourne dans son propre thread)
 # ─────────────────────────────────────────────
-def main():
-    log.info("🚀 Démarrage du service de forwarding Free → Gmail (IMAP IDLE)")
+def folder_worker(folder: str):
     delay = RECONNECT_DELAY_INIT
-
     while _running:
         try:
-            imap = connect_imap()
-            delay = RECONNECT_DELAY_INIT  # reset backoff après connexion réussie
-            idle_loop(imap)
+            imap = connect_imap(folder)
+            delay = RECONNECT_DELAY_INIT
+            idle_loop(imap, folder)
             try:
                 imap.logout()
             except Exception:
@@ -286,13 +311,42 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            log.error("Erreur connexion/IDLE : %s", e)
+            log.error("[%s] Erreur : %s", folder, e)
             if _running:
-                log.info("Reconnexion dans %ds…", delay)
-                time.sleep(delay)
+                log.info("[%s] Reconnexion dans %ds...", folder, delay)
+                _stop_event.wait(timeout=delay)
                 delay = min(delay * 2, RECONNECT_DELAY_MAX)
 
-    log.info("Service arrêté. Bye.")
+    log.info("[%s] Worker arrete.", folder)
+
+
+# ─────────────────────────────────────────────
+# POINT D'ENTRÉE
+# ─────────────────────────────────────────────
+def main():
+    log.info("Demarrage du service Free -> Gmail (IMAP IDLE, %d dossier(s))", len(IMAP_FOLDERS))
+    for f in IMAP_FOLDERS:
+        log.info("  - %s", f)
+
+    # Un thread daemon par dossier — ils s'arrêtent quand le thread principal quitte
+    threads = []
+    for folder in IMAP_FOLDERS:
+        t = threading.Thread(target=folder_worker, args=(folder,), name=f"idle-{folder}", daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Attendre Ctrl+C ou SIGTERM
+    try:
+        while _running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+
+    log.info("Arret demande — attente de la fin des workers...")
+    _stop_event.set()
+    for t in threads:
+        t.join(timeout=10)
+    log.info("Service arrete.")
 
 
 if __name__ == "__main__":
