@@ -219,14 +219,48 @@ def fetch_and_forward(imap: imaplib.IMAP4_SSL) -> int:
 
 
 # ─────────────────────────────────────────────
+# ENCODAGE UTF-7 MODIFIE (RFC 3501)
+# Les noms de dossiers IMAP avec accents doivent etre encodes en UTF-7 modifie.
+# Python ne fournit pas ce codec nativement — on l'implemente ici.
+# ─────────────────────────────────────────────
+def encode_imap_utf7(folder: str) -> str:
+    # Les caracteres ASCII imprimables (sauf &) passent tels quels
+    # Les autres sont encodes en base64 UTF-16BE entre & et -
+    import base64
+    res = []
+    buf = []
+
+    def flush():
+        if buf:
+            encoded = base64.b64encode("".join(buf).encode("utf-16-be")).decode("ascii").rstrip("=")
+            res.append(f"&{encoded}-")
+            buf.clear()
+
+    for ch in folder:
+        if ch == "&":
+            flush()
+            res.append("&-")
+        elif 0x20 <= ord(ch) <= 0x7e:
+            flush()
+            res.append(ch)
+        else:
+            buf.append(ch)
+
+    flush()
+    return "".join(res)
+
+
+# ─────────────────────────────────────────────
 # CONNEXION IMAP (une connexion par dossier)
 # ─────────────────────────────────────────────
 def connect_imap(folder: str) -> imaplib.IMAP4_SSL:
     imap = imaplib.IMAP4_SSL(FREE_IMAP_HOST, FREE_IMAP_PORT)
     imap.login(FREE_EMAIL, FREE_PASSWORD)
-    status, detail = imap.select(folder)
+    encoded_folder = encode_imap_utf7(folder)
+    # Guillemets obligatoires si le nom contient des espaces ou caracteres speciaux
+    status, detail = imap.select(f'"{encoded_folder}"')
     if status != "OK":
-        raise RuntimeError(f"Dossier introuvable : {folder!r} ({detail})")
+        raise RuntimeError(f"Dossier introuvable : {folder!r} (encode: {encoded_folder!r}) ({detail})")
     log.info("[%s] Connecte.", folder)
     return imap
 
