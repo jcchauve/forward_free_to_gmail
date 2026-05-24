@@ -74,7 +74,7 @@ GMAIL_PASSWORD = _creds["GMAIL_PASSWORD"]
 # Le nom exact doit correspondre au nom du dossier sur le serveur Free.fr.
 IMAP_FOLDERS = [
     "INBOX",
-    "Flux d'activite",   # verifier le nom exact via un client mail
+    "Flux d&IBk-activit&AOk-",   # verifier le nom exact via un client mail
 ]
 
 
@@ -256,7 +256,10 @@ def encode_imap_utf7(folder: str) -> str:
 def connect_imap(folder: str) -> imaplib.IMAP4_SSL:
     imap = imaplib.IMAP4_SSL(FREE_IMAP_HOST, FREE_IMAP_PORT)
     imap.login(FREE_EMAIL, FREE_PASSWORD)
-    encoded_folder = encode_imap_utf7(folder)
+    #encoded_folder = encode_imap_utf7(folder)
+    encoded_folder = folder
+    log.debug(f"Folder List: {imap.list()}")
+    
     # Guillemets obligatoires si le nom contient des espaces ou caracteres speciaux
     status, detail = imap.select(f'"{encoded_folder}"')
     if status != "OK":
