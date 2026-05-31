@@ -134,11 +134,12 @@ if hasattr(signal, "SIGTERM"):          # absent sur Windows
 # ─────────────────────────────────────────────
 # CONSTRUCTION DU MESSAGE FORWARDÉ
 # ─────────────────────────────────────────────
-def build_forward_message(original: email.message.Message) -> MIMEMultipart:
+def build_forward_message(original: email.message.Message, folder: str) -> MIMEMultipart:
     fwd = MIMEMultipart("mixed")
     fwd["From"]    = GMAIL_EMAIL
     fwd["To"]      = GMAIL_EMAIL
-    fwd["Subject"] = "Fwd: " + original.get("Subject", "(sans objet)")
+    subject_folder = folder.split(" ")[0]
+    fwd["Subject"] = f"[{subject_folder}] Fwd: " + original.get("Subject", "(sans objet)")
 
     header_text = (
         f"\n---------- Message transfere ----------\n"
@@ -180,13 +181,13 @@ def build_forward_message(original: email.message.Message) -> MIMEMultipart:
 # ─────────────────────────────────────────────
 # ENVOI GMAIL
 # ─────────────────────────────────────────────
-def send_via_gmail(original: email.message.Message):
+def send_via_gmail(original: email.message.Message, folder: str):
     smtp = smtplib.SMTP(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT)
     try:
         smtp.ehlo()
         smtp.starttls()
         smtp.login(GMAIL_EMAIL, GMAIL_PASSWORD)
-        fwd = build_forward_message(original)
+        fwd = build_forward_message(original, folder)
         smtp.sendmail(GMAIL_EMAIL, GMAIL_EMAIL, fwd.as_string())
     finally:
         smtp.quit()
@@ -195,7 +196,7 @@ def send_via_gmail(original: email.message.Message):
 # ─────────────────────────────────────────────
 # FETCH & FORWARD
 # ─────────────────────────────────────────────
-def fetch_and_forward(imap: imaplib.IMAP4_SSL) -> int:
+def fetch_and_forward(imap: imaplib.IMAP4_SSL, folder: str) -> int:
     _, uids_raw = imap.uid("search", None, "UNSEEN")
     uids = uids_raw[0].split()
     if not uids:
@@ -208,7 +209,7 @@ def fetch_and_forward(imap: imaplib.IMAP4_SSL) -> int:
         original = email.message_from_bytes(msg_data[0][1])
         log.info("  -> %s", original.get("Subject", "(sans objet)"))
         try:
-            send_via_gmail(original)
+            send_via_gmail(original, folder)
             imap.uid("store", uid, "+FLAGS", "\\Seen")
             count += 1
             log.info("     Transfere et marque comme lu.")
@@ -256,10 +257,7 @@ def encode_imap_utf7(folder: str) -> str:
 def connect_imap(folder: str) -> imaplib.IMAP4_SSL:
     imap = imaplib.IMAP4_SSL(FREE_IMAP_HOST, FREE_IMAP_PORT)
     imap.login(FREE_EMAIL, FREE_PASSWORD)
-    #encoded_folder = encode_imap_utf7(folder)
     encoded_folder = folder
-    log.debug(f"Folder List: {imap.list()}")
-    
     # Guillemets obligatoires si le nom contient des espaces ou caracteres speciaux
     status, detail = imap.select(f'"{encoded_folder}"')
     if status != "OK":
@@ -277,7 +275,7 @@ def connect_imap(folder: str) -> imaplib.IMAP4_SSL:
 # ─────────────────────────────────────────────
 def idle_loop(imap: imaplib.IMAP4_SSL, folder: str):
     # Traiter les eventuels messages deja non lus a la connexion
-    fetch_and_forward(imap)
+    fetch_and_forward(imap, folder)
 
     raw_sock = imap.socket()
     raw_sock.settimeout(SOCKET_READ_TIMEOUT)
@@ -319,7 +317,7 @@ def idle_loop(imap: imaplib.IMAP4_SSL, folder: str):
 
         if notified:
             log.info("[%s] Notification -- verification des nouveaux messages...", folder)
-            fetch_and_forward(imap)
+            fetch_and_forward(imap, folder)
         elif not _running:
             break
         else:
